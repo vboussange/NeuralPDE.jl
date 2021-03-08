@@ -1,4 +1,40 @@
 """
+    IntegroPDEProblem(f, μ, σ, x0, tspan)
+A non local non linear PDE problem.
+Consider `du/dt = l(u) + \int f(u,x) dx`; where l is the nonlinear Lipschitz function
+# Arguments
+* `f` : The function f(u)
+* `μ` : The drift function of X from Ito's Lemma
+* `μ` : The noise function of X from Ito's Lemma
+* `x0`: The initial X for the problem.
+* `tspan`: The timespan of the problem.
+"""
+struct IntegroPDEProblem{F,Mu,Sigma,X,T,P,A,UD,K} <: DiffEqBase.DEProblem
+    f::F
+    μ::Mu
+    σ::Sigma
+    X0::X
+    tspan::Tuple{T,T}
+    p::P
+    A::A
+    u_domain::UD
+    kwargs::K
+    IntegroPDEProblem(f,μ,σ,X0,tspan,p=nothing;A=nothing,u_domain=nothing,kwargs...) = new{typeof(f),
+                                                         typeof(μ),typeof(σ),
+                                                         typeof(X0),eltype(tspan),
+                                                         typeof(p),typeof(A),typeof(u_domain),typeof(kwargs)}(
+                                                         g,f,μ,σ,X0,tspan,p,A,u_domain,kwargs)
+end
+
+Base.summary(prob::IntegroPDEProblem) = string(nameof(typeof(prob)))
+
+function Base.show(io::IO, A::IntegroPDEProblem)
+  println(io,summary(A))
+  print(io,"timespan: ")
+  show(io,A.tspan)
+end
+
+"""
 Deep splitting algorithm for solving non local non linear PDES.
 
 Arguments:
@@ -10,16 +46,22 @@ Arguments:
 
 """
 
-struct NNPDEHan{C1,C2,O} <: NeuralPDEAlgorithm
+struct NNPDEDS{C1,O} <: NeuralPDEAlgorithm
     u0::C1
-    σᵀ∇u::C2
+    K::Int
     opt::O
 end
-NNPDEHan(u0,σᵀ∇u;opt=Flux.ADAM(0.1)) = NNPDEHan(u0,σᵀ∇u,opt)
+NNPDEDS(u0;K=1,opt=Flux.ADAM(0.1)) = NNPDEDS(u0,K,opt)
 
 function DiffEqBase.solve(
     prob::TerminalPDEProblem,
-    alg::NNPDEHan;
+    alg::NNPDEDS,
+    sde,
+    mc_sample;
+    batch_size = 1,
+    std_sampling_mc,
+    lr_boundaries,
+    lr_values,
     abstol = 1f-6,
     verbose = false,
     maxiters = 300,
@@ -36,6 +78,7 @@ function DiffEqBase.solve(
 
     X0 = prob.X0
     ts = prob.tspan[1]:dt:prob.tspan[2]
+    N = length(ts)
     d  = length(X0)
     g,f,μ,σ,p = prob.g,prob.f,prob.μ,prob.σ,prob.p
 
@@ -48,6 +91,7 @@ function DiffEqBase.solve(
     σᵀ∇u = alg.σᵀ∇u
     ps = Flux.params(u0, σᵀ∇u...)
 
+    # this is the splitting model
     function sol()
         map(1:trajectories) do j
             u = u0(X0)[1]
@@ -76,82 +120,18 @@ function DiffEqBase.solve(
         l < abstol && Flux.stop()
     end
 
-    Flux.train!(loss, ps, data, opt; cb = cb)
-
-
-    if give_limit == false
-        save_everystep ? iters : u0(X0)[1]
-    else
-        A = prob.A
-        u_domain = prob.u_domain
-
-        ## UPPER LIMIT
-        sdeProb = SDEProblem(μ , σ , X0 , prob.tspan)
-        ensembleprob = EnsembleProblem(sdeProb)
-        sim = solve(ensembleprob, EM(), ensemblealg, dt=dt, trajectories=trajectories_upper,prob.kwargs...)
-        function sol_high()
-            map(sim.u) do u
-                xsde = u.u
-                U = g(xsde[end])
-                u = u0(X0)[1]
-                for i in length(ts):-1:3
-                    t = ts[i]
-                    _σᵀ∇u = σᵀ∇u[i-1](xsde[i-1])
-                    dW = sqrt(dt)*randn(d)
-                    U = U .+ f(xsde[i-1], U, _σᵀ∇u, p, t)*dt .- _σᵀ∇u'*dW
-                end
-                U
-            end
-        end
-
-        loss_() = sum(sol_high())/trajectories_upper
-
-        ps = Flux.params(u0, σᵀ∇u...)
-        cb = function ()
-            l = loss_()
-            verbose && println("Current loss is: $l")
-            l < abstol && Flux.stop()
-        end
-        dataS = Iterators.repeated((), maxiters_upper)
-        Flux.train!(loss_, ps, dataS, ADAM(0.01); cb = cb)
-        u_high = loss_()
-        ##Lower Limit
-
-        # Function to precalculate the f values over the domain
-        function give_f_matrix(X,urange,σᵀ∇u,p,t)
-          map(urange) do u
-            f(X,u,σᵀ∇u,p,t)
-          end
-        end
-
-        #The Legendre transform that uses the precalculated f values.
-        function legendre_transform(f_matrix , a , urange)
-            le = a.*(collect(urange)) .- f_matrix
-            return maximum(le)
-        end
-
-        function sol_low()
-            map(1:trajectories_lower) do j
-                u = u0(X0)[1]
-                X = X0
-                I = zero(eltype(u))
-                Q = zero(eltype(u))
-                for i in 1:length(ts)-1
-                    t = ts[i]
-                    _σᵀ∇u = σᵀ∇u[i](X)
-                    dW = sqrt(dt)*randn(d)
-                    u = u - f(X, u, _σᵀ∇u, p, t)*dt + _σᵀ∇u'*dW
-                    X  = X .+ μ(X,p,t)*dt .+ σ(X,p,t)*dW
-                    f_matrix = give_f_matrix(X , u_domain, _σᵀ∇u, p, ts[i])
-                    a_ = A[findmax(collect(A).*u .- collect(legendre_transform(f_matrix, a, u_domain) for a in A))[2]]
-                    I = I + a_*dt
-                    Q = Q + exp(I)*legendre_transform(f_matrix, a_, u_domain)
-                end
-                I , Q , X
-            end
-        end
-        u_low = sum(exp(I)*g(X) - Q for (I ,Q ,X) in sol_low())/(trajectories_lower)
-        save_everystep ? iters : u0(X0)[1] , u_low , u_high
+    for (i,t) in enumerate(ts)
+        # this is equivalent to the sde_loop
+        y1 = X0 .+ randn(d,batch_size) .* σ .* sqrt(ts[end] - t)
+        y0 = X0 .+ randn(d,batch_size) .* σ .* sqrt(ts[end] - ts[i+1])
+        y1 = Batch(c for eachcol(y1))
+        y0 = Batch(c for eachcol(y0))
+        loss, v_n, v_j = splitting_model()
+        # Victor : you should make sure that the batch works
+        # t
+        Flux.train!(loss, ps, data, opt; cb = cb)
     end
+
+    save_everystep ? iters : u0(X0)[1]
 
 end #pde_solve
