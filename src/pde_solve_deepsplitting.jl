@@ -1,15 +1,21 @@
+using DiffEqBase
+using Flux, Zygote, LinearAlgebra, StochasticDiffEq
+import NeuralPDE
+## this one is in fact not used!
 """
-    IntegroPDEProblem(f, μ, σ, x0, tspan)
+    PIDEProblem(g,f, μ, σ, x0, tspan)
 A non local non linear PDE problem.
-Consider `du/dt = l(u) + \int f(u,x) dx`; where l is the nonlinear Lipschitz function
+Consider `du/dt = l(u) + \\int f(u,x) dx`; where l is the nonlinear Lipschitz function
 # Arguments
-* `f` : The function f(u)
+* `g` : The terminal condition for the equation.
+* `f` : The function f(u(x),u(y),du(x),du(y),x,y)
 * `μ` : The drift function of X from Ito's Lemma
 * `μ` : The noise function of X from Ito's Lemma
 * `x0`: The initial X for the problem.
 * `tspan`: The timespan of the problem.
 """
-struct IntegroPDEProblem{F,Mu,Sigma,X,T,P,A,UD,K} <: DiffEqBase.DEProblem
+struct PIDEProblem{G,F,Mu,Sigma,X,T,P,A,UD,K} <: DiffEqBase.DEProblem
+    g::G
     f::F
     μ::Mu
     σ::Sigma
@@ -19,16 +25,16 @@ struct IntegroPDEProblem{F,Mu,Sigma,X,T,P,A,UD,K} <: DiffEqBase.DEProblem
     A::A
     u_domain::UD
     kwargs::K
-    IntegroPDEProblem(f,μ,σ,X0,tspan,p=nothing;A=nothing,u_domain=nothing,kwargs...) = new{typeof(f),
+    PIDEProblem(g,f,μ,σ,X0,tspan,p=nothing;A=nothing,u_domain=nothing,kwargs...) = new{typeof(g),typeof(f),
                                                          typeof(μ),typeof(σ),
                                                          typeof(X0),eltype(tspan),
                                                          typeof(p),typeof(A),typeof(u_domain),typeof(kwargs)}(
                                                          g,f,μ,σ,X0,tspan,p,A,u_domain,kwargs)
 end
 
-Base.summary(prob::IntegroPDEProblem) = string(nameof(typeof(prob)))
+Base.summary(prob::PIDEProblem) = string(nameof(typeof(prob)))
 
-function Base.show(io::IO, A::IntegroPDEProblem)
+function Base.show(io::IO, A::PIDEProblem)
   println(io,summary(A))
   print(io,"timespan: ")
   show(io,A.tspan)
@@ -46,35 +52,31 @@ Arguments:
 
 """
 
-struct NNPDEDS{C1,O} <: NeuralPDEAlgorithm
-    u0::C1
+struct NNPDEDS{C1,O} <: NeuralPDE.NeuralPDEAlgorithm
+    nn::C1
     K::Int
     opt::O
 end
-NNPDEDS(u0;K=1,opt=Flux.ADAM(0.1)) = NNPDEDS(u0,K,opt)
+NNPDEDS(nn;K=1,opt=Flux.ADAM(0.1)) = NNPDEDS(nn,K,opt)
 
 function DiffEqBase.solve(
-    prob::TerminalPDEProblem,
+    # prob::PIDEProblem,
+    prob::PIDEProblem,
     alg::NNPDEDS,
-    sde,
     mc_sample;
+    dt,
     batch_size = 1,
-    std_sampling_mc,
-    lr_boundaries,
-    lr_values,
     abstol = 1f-6,
     verbose = false,
     maxiters = 300,
     save_everystep = false,
-    dt,
     give_limit = false,
-    trajectories,
     sdealg = EM(),
     ensemblealg = EnsembleThreads(),
-    trajectories_upper = 1000,
-    trajectories_lower = 1000,
     maxiters_upper = 10,
     )
+
+    println("leeeeeets goooo")
 
     X0 = prob.X0
     ts = prob.tspan[1]:dt:prob.tspan[2]
@@ -86,52 +88,59 @@ function DiffEqBase.solve(
 
 
     #hidden layer
+    nn = alg.nn
+    K = alg.K
     opt = alg.opt
-    u0 = alg.u0
-    σᵀ∇u = alg.σᵀ∇u
-    ps = Flux.params(u0, σᵀ∇u...)
+    N = length(ts)
 
-    # this is the splitting model
-    function sol()
-        map(1:trajectories) do j
-            u = u0(X0)[1]
-            X = X0
-            for i in 1:length(ts)-1
-                t = ts[i]
-                _σᵀ∇u = σᵀ∇u[i](X)
-                dW = sqrt(dt)*randn(d)
-                u = u - f(X, u, _σᵀ∇u, p, t)*dt + _σᵀ∇u'*dW
-                X  = X .+ μ(X,p,t)*dt .+ σ(X,p,t)*dW
+    vi(x) = g(x)
+    vj = deepcopy(nn)
+
+    for net in 1:N
+        verbose && println("Step $(net) / $(N) ")
+        ps = Flux.params(vj)
+        # this is the splitting model
+        function splitting_model()
+            # calculating SDE trajectories
+            # Todo : instead of using this map, one should introduce batches with
+            # size(y0) = (d,batch_size)
+            map(1:batch_size) do _
+                y0 = y1 = X0
+                for i in 1:net
+                    t = ts[i]
+                    dW = sqrt(dt)*randn(d)
+                    y0 = y1
+                    y1  = y0 .+ μ(y0,p,t)*dt .+ σ(y0,p,t)*dW
+                end
+            # Monte Carlo integration
+            # z is the variable that gets integreated
+                _int = 0
+                t = ts[net]
+                for _ in 1:K
+                     z = mc_sample(y0)
+                    _int += f(y1, z, first(vi(y1)), first(vi(z)),0. ,0. , p, t)
+                end
+                u = first(vj(y0)) - (first(vi(y1)) + dt * _int / K)
             end
-            X,u
         end
-    end
 
-    function loss()
-        mean(sum(abs2,g(X) - u) for (X,u) in sol())
-    end
+        function loss()
+            mean(sum(abs2,u) for u in splitting_model())
+        end
 
-    iters = eltype(X0)[]
+        iters = eltype(X0)[]
 
-    cb = function ()
-        save_everystep && push!(iters, u0(X0)[1])
-        l = loss()
-        verbose && println("Current loss is: $l")
-        l < abstol && Flux.stop()
-    end
+        function cb()
+            # save_everystep && push!(iters, vi(X0)[1])
+            l = loss()
+            verbose && println("Current loss is: $l")
+            l < abstol && Flux.stop()
+        end
 
-    for (i,t) in enumerate(ts)
-        # this is equivalent to the sde_loop
-        y1 = X0 .+ randn(d,batch_size) .* σ .* sqrt(ts[end] - t)
-        y0 = X0 .+ randn(d,batch_size) .* σ .* sqrt(ts[end] - ts[i+1])
-        y1 = Batch(c for eachcol(y1))
-        y0 = Batch(c for eachcol(y0))
-        loss, v_n, v_j = splitting_model()
-        # Victor : you should make sure that the batch works
-        # t
         Flux.train!(loss, ps, data, opt; cb = cb)
+        vi = deepcopy(vj)
     end
+    vj(X0)[1]
+    # save_everystep ? iters : u0(X0)[1]
 
-    save_everystep ? iters : u0(X0)[1]
-
-end #pde_solve
+end

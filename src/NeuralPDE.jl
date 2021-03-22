@@ -161,6 +161,7 @@ end
 
 include("ode_solve.jl")
 include("pde_solve.jl")
+# include("pde_solve_deepsplitting.jl")
 include("pde_solve_ns.jl")
 include("kolmogorov_solve.jl")
 include("rode_solve.jl")
@@ -168,7 +169,9 @@ include("stopping_solve.jl")
 include("pinns_pde_solve.jl")
 include("param_kolmogorov_solve.jl")
 
-export NNODE, TerminalPDEProblem, NNPDEHan, NNPDENS, NNRODE,
+export NNODE, TerminalPDEProblem, NNPDEHan,
+       # NNPDEDS,
+       NNPDENS, NNRODE,
        KolmogorovPDEProblem, NNKolmogorov, NNStopping,ParamKolmogorovPDEProblem,KolmogorovParamDomain, NNParamKolmogorov,
        PhysicsInformedNN, discretize,
        GridTraining, StochasticTraining, QuadratureTraining, QuasiRandomTraining
